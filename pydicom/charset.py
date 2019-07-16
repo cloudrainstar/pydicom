@@ -56,6 +56,7 @@ python_encoding = {
     'ISO 2022 GBK': 'GBK',  # from DICOM correction CP1234
     'ISO 2022 58': 'GB2312',  # from DICOM correction CP1234
     'GBK': 'GBK',  # from DICOM correction CP1234
+    'ISO 2022 B5': 'big5-hkscs',
 }
 
 # these encodings cannot be used with code extensions
