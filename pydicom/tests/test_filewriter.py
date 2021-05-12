@@ -300,8 +300,7 @@ class TestScratchWriteDateTime(TestWriteFile):
         DA_expected = date(1961, 8, 4)
         tzinfo = timezone(timedelta(seconds=-21600), '-0600')
         multi_DT_expected = (datetime(1961, 8, 4), datetime(
-            1963, 11, 22, 12, 30, 0, 0,
-            timezone(timedelta(seconds=-21600), '-0600')))
+            1963, 11, 22, 12, 30, 0, 0, tzinfo))
         multi_TM_expected = (time(1, 23, 45), time(11, 11, 11))
         TM_expected = time(11, 11, 11, 1)
         ds = dcmread(datetime_name)
@@ -1521,9 +1520,9 @@ class TestWriteToStandard:
         ds_expl = dcmread(fp)
 
         assert ds_expl[(0x0009, 0x0010)].VR == 'LO'  # private creator
-        assert ds_expl[(0x0009, 0x1001)].VR == 'UN'  # originally LO
-        assert ds_expl[(0x0009, 0x10e7)].VR == 'UN'  # originally UL
-        assert ds_expl[(0x0043, 0x1010)].VR == 'UN'  # originally US
+        assert ds_expl[(0x0009, 0x1001)].VR == 'LO'
+        assert ds_expl[(0x0009, 0x10e7)].VR == 'UL'
+        assert ds_expl[(0x0043, 0x1010)].VR == 'US'
 
     def test_convert_rgb_from_implicit_to_explicit_vr(self, no_numpy_use):
         """Test converting an RGB dataset from implicit to explicit VR

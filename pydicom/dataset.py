@@ -35,6 +35,7 @@ import weakref
 
 if TYPE_CHECKING:
     try:
+        import numpy
         import numpy as np
     except ImportError:
         pass
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
 import pydicom  # for dcmwrite
 import pydicom.charset
 import pydicom.config
-from pydicom import datadict, jsonrep, config
+from pydicom import jsonrep, config
 from pydicom._version import __version_info__
 from pydicom.charset import default_encoding, convert_encodings
 from pydicom.config import logger
@@ -50,13 +51,16 @@ from pydicom.datadict import (
     dictionary_VR, tag_for_keyword, keyword_for_tag, repeater_has_keyword
 )
 from pydicom.dataelem import DataElement, DataElement_from_raw, RawDataElement
+from pydicom.encaps import encapsulate, encapsulate_extended
 from pydicom.fileutil import path_from_pathlike
 from pydicom.pixel_data_handlers.util import (
     convert_color_space, reshape_pixel_array, get_image_pixel_ids
 )
 from pydicom.tag import Tag, BaseTag, tag_in_exception, TagType
-from pydicom.uid import (ExplicitVRLittleEndian, ImplicitVRLittleEndian,
-                         ExplicitVRBigEndian, PYDICOM_IMPLEMENTATION_UID)
+from pydicom.uid import (
+    ExplicitVRLittleEndian, ImplicitVRLittleEndian, ExplicitVRBigEndian,
+    RLELossless, PYDICOM_IMPLEMENTATION_UID, UID
+)
 from pydicom.waveforms import numpy_handler as wave_handler
 
 
@@ -503,8 +507,8 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             return Tag(name) in self._dict
         except Exception as exc:
             msg = (
-                "Invalid value used with the 'in' operator: must be an "
-                "element tag as a 2-tuple or int, or an element keyword"
+                f"Invalid value '{name}' used with the 'in' operator: must be "
+                "an element tag as a 2-tuple or int, or an element keyword"
             )
             if isinstance(exc, OverflowError):
                 msg = (
@@ -932,7 +936,7 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             else:
                 character_set = default_encoding
             # Not converted from raw form read from file yet; do so now
-            self[tag] = DataElement_from_raw(data_elem, character_set)
+            self[tag] = DataElement_from_raw(data_elem, character_set, self)
 
             # If the Element has an ambiguous VR, try to correct it
             if 'or' in self[tag].VR:
@@ -1478,7 +1482,8 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
         transfer_syntax = self.file_meta.TransferSyntaxUID
         possible_handlers = [
             hh for hh in pydicom.config.pixel_data_handlers
-            if hh.supports_transfer_syntax(transfer_syntax)
+            if hh is not None
+            and hh.supports_transfer_syntax(transfer_syntax)
         ]
 
         # No handlers support the transfer syntax
@@ -1562,6 +1567,162 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             )
 
         self._pixel_id = get_image_pixel_ids(self)
+
+    def compress(
+        self,
+        transfer_syntax_uid: str,
+        arr: Optional["numpy.ndarray"] = None,
+        encoding_plugin: str = '',
+        decoding_plugin: str = '',
+        encapsulate_ext: bool = False,
+        **kwargs
+    ) -> None:
+        """Compress and update the dataset in-place with the resulting
+        :dcm:`encapsulated<part05/sect_A.4.html>` pixel data.
+
+        .. versionadded:: 2.2
+
+        The dataset must already have the following
+        :dcm:`Image Pixel<part03/sect_C.7.6.3.html>` module elements present
+        with correct values that correspond to the resulting compressed
+        pixel data:
+
+        * (0028,0002) *Samples per Pixel*
+        * (0028,0004) *Photometric Interpretation*
+        * (0028,0008) *Number of Frames* (if more than 1 frame will be present)
+        * (0028,0010) *Rows*
+        * (0028,0011) *Columns*
+        * (0028,0100) *Bits Allocated*
+        * (0028,0101) *Bits Stored*
+        * (0028,0103) *Pixel Representation*
+
+        This method will add the file meta dataset if none is present and add
+        or modify the following elements:
+
+        * (0002,0010) *Transfer Syntax UID*
+        * (7FE0,0010) *Pixel Data*
+
+        If *Samples per Pixel* is greater than 1 then the following element
+        will also be added:
+
+        * (0028,0006) *Planar Configuration*
+
+        If the compressed pixel data is too large for encapsulation using a
+        basic offset table then an :dcm:`extended offset table
+        <part03/sect_C.7.6.3.html>` will be used instead, in which case the
+        following elements will also be added:
+
+        * (7FE0,0001) *Extended Offset Table*
+        * (7FE0,0002) *Extended Offset Table Lengths*
+
+        **Supported Transfer Syntax UIDs**
+
+        +--------------------------------------+--------------------------+
+        | UID                                  | Plugins                  |
+        +======================================+==========================+
+        | *RLE Lossless* - 1.2.840.10008.1.2.5 | pydicom, pylibjpeg, gdcm |
+        +--------------------------------------+--------------------------+
+
+        Examples
+        --------
+
+        Compress the existing *Pixel Data* in place:
+
+        >>> from pydicom.data import get_testdata_file
+        >>> from pydicom.uid import RLELossless
+        >>> ds = get_testdata_file("CT_small.dcm", read=True)
+        >>> ds.compress(RLELossless)
+        >>> ds.save_as("CT_small_rle.dcm")
+
+        Parameters
+        ----------
+        transfer_syntax_uid : pydicom.uid.UID
+            The UID of the :dcm:`transfer syntax<part05/chapter_10.html>` to
+            use when compressing the pixel data.
+        arr : numpy.ndarray, optional
+            Compress the uncompressed pixel data in `arr` and use it
+            to set the *Pixel Data*. If `arr` is not used then the
+            existing *Pixel Data* in the dataset will be decompressed (if
+            required) and compressed instead. The :attr:`~numpy.ndarray.shape`,
+            :class:`~numpy.dtype` and contents of the array should match the
+            dataset.
+        encoding_plugin : str, optional
+            Use the `encoding_plugin` to compress the pixel data. See the
+            :doc:`user guide </old/image_data_compression>` for a list of
+            plugins available for each UID and their dependencies. If not
+            specified then all available plugins will be tried (default).
+        decoding_plugin : str, optional
+            If `arr` is not used and the existing *Pixel Data* is compressed
+            then the name of the :mod:`image data handler
+            <pydicom.pixel_data_handlers>` to use to decompress it. If not
+            specified then all available handlers will be tried (default).
+        encapsulate_ext : bool, optional
+            If ``True`` then force the addition of an extended offset table.
+            If ``False`` (default) then an extended offset table
+            will be added if needed for large amounts of compressed *Pixel
+            Data*, otherwise just the basic offset table will be used.
+        **kwargs
+            Optional keyword parameters for the encoding plugin may also be
+            present. See the :doc:`encoding plugins options
+            </guides/encoder_plugin_options>` for more information.
+        """
+        from pydicom.encoders import get_encoder
+
+        uid = UID(transfer_syntax_uid)
+
+        # Raises NotImplementedError if `uid` is not supported
+        encoder = get_encoder(uid)
+        if not encoder.is_available:
+            missing = "\n".join(
+                [f"    {s}" for s in encoder.missing_dependencies]
+            )
+            raise RuntimeError(
+                f"The '{uid.name}' encoder is unavailable because its "
+                f"encoding plugins are missing dependencies:\n"
+                f"{missing}"
+            )
+
+        if arr is None:
+            # Encode the current *Pixel Data* (will decode first if required)
+            frame_iterator = encoder.iter_encode(
+                self,
+                encoding_plugin=encoding_plugin,
+                decoding_plugin=decoding_plugin,
+                **kwargs
+            )
+        else:
+            # Encode from an uncompressed pixel data array
+            kwargs.update(encoder.kwargs_from_ds(self))
+            frame_iterator = encoder.iter_encode(
+                arr,
+                encoding_plugin=encoding_plugin,
+                **kwargs
+            )
+
+        # Encode!
+        encoded = [f for f in frame_iterator]
+
+        # Encapsulate the encoded *Pixel Data*
+        nr_frames = getattr(self, "NumberOfFrames", 1) or 1
+        total = (nr_frames - 1) * 8 + sum([len(f) for f in encoded[:-1]])
+        if encapsulate_ext or total > 2**32 - 1:
+            (self.PixelData,
+             self.ExtendedOffsetTable,
+             self.ExtendedOffsetTableLengths) = encapsulate_extended(encoded)
+        else:
+            self.PixelData = encapsulate(encoded)
+
+        self['PixelData'].is_undefined_length = True
+
+        # Set the correct *Transfer Syntax UID*
+        if not hasattr(self, 'file_meta'):
+            self.file_meta = FileMetaDataset()
+
+        self.file_meta.TransferSyntaxUID = uid
+
+        # Add or update any other required elements
+        if self.SamplesPerPixel > 1:
+            self.PlanarConfiguration = 1 if uid == RLELossless else 0
 
     def decompress(self, handler_name: str = '') -> None:
         """Decompresses *Pixel Data* and modifies the :class:`Dataset`
@@ -2058,7 +2219,8 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             private_creator_tag = Tag(elem_tag.group, private_block)
             if private_creator_tag in self and elem_tag != private_creator_tag:
                 if elem.is_raw:
-                    elem = DataElement_from_raw(elem, self._character_set)
+                    elem = DataElement_from_raw(
+                        elem, self._character_set, self)
                 elem.private_creator = self[private_creator_tag].value
 
         self._dict[elem_tag] = elem
@@ -2277,7 +2439,8 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
     def to_json_dict(
         self,
         bulk_data_threshold: int = 1024,
-        bulk_data_element_handler: Optional[Callable[[DataElement], str]] = None  # noqa
+        bulk_data_element_handler: Optional[Callable[[DataElement], str]] = None,  # noqa
+        suppress_invalid_tags: bool = False,
     ) -> _Dataset:
         """Return a dictionary representation of the :class:`Dataset`
         conforming to the DICOM JSON Model as described in the DICOM
@@ -2296,6 +2459,9 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             Callable function that accepts a bulk data element and returns a
             JSON representation of the data element (dictionary including the
             "vr" key and either the "InlineBinary" or the "BulkDataURI" key).
+        suppress_invalid_tags : bool, optional
+            Flag to specify if errors while serializing tags should be logged
+            and the tag dropped or if the error should be bubbled up.
 
         Returns
         -------
@@ -2306,17 +2472,23 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
         for key in self.keys():
             json_key = '{:08X}'.format(key)
             data_element = self[key]
-            json_dataset[json_key] = data_element.to_json_dict(
-                bulk_data_element_handler=bulk_data_element_handler,
-                bulk_data_threshold=bulk_data_threshold
-            )
+            try:
+                json_dataset[json_key] = data_element.to_json_dict(
+                    bulk_data_element_handler=bulk_data_element_handler,
+                    bulk_data_threshold=bulk_data_threshold
+                )
+            except Exception as exc:
+                logger.error("Error while processing tag {}".format(json_key))
+                if not suppress_invalid_tags:
+                    raise exc
         return json_dataset
 
     def to_json(
         self,
         bulk_data_threshold: int = 1024,
         bulk_data_element_handler: Optional[Callable[[DataElement], str]] = None,  # noqa
-        dump_handler: Optional[Callable[["Dataset"], str]] = None
+        dump_handler: Optional[Callable[["Dataset"], str]] = None,
+        suppress_invalid_tags: bool = False,
     ) -> str:
         """Return a JSON representation of the :class:`Dataset`.
 
@@ -2344,6 +2516,9 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
 
                 Make sure to use a dump handler that sorts the keys (see
                 example below) to create DICOM-conformant JSON.
+        suppress_invalid_tags : bool, optional
+            Flag to specify if errors while serializing tags should be logged
+            and the tag dropped or if the error should be bubbled up.
 
         Returns
         -------
@@ -2364,7 +2539,12 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
             dump_handler = json_dump
 
         return dump_handler(
-            self.to_json_dict(bulk_data_threshold, bulk_data_element_handler))
+            self.to_json_dict(
+                bulk_data_threshold,
+                bulk_data_element_handler,
+                suppress_invalid_tags=suppress_invalid_tags
+            )
+        )
 
     def __getstate__(self) -> Dict[str, Any]:
         # pickle cannot handle weakref - remove parent
@@ -2379,6 +2559,9 @@ class Dataset(Dict[BaseTag, _DatasetValue]):
         self.__dict__['parent'] = None
 
     __repr__ = __str__
+
+
+_FileDataset = TypeVar("_FileDataset", bound="FileDataset")
 
 
 class FileDataset(Dataset):
@@ -2478,31 +2661,50 @@ class FileDataset(Dataset):
                 statinfo = os.stat(filename)
                 self.timestamp = statinfo.st_mtime
 
-    def __eq__(self, other: object) -> bool:
-        """Compare `self` and `other` for equality.
+    def _copy_implementation(self, copy_function: Callable) -> _FileDataset:
+        """Implementation of ``__copy__`` and ``__deepcopy__``.
+        Sets the filename to ``None`` if it isn't a string,
+        and copies all other attributes using `copy_function`.
+        """
+        copied = self.__class__(
+            self.filename, self, self.preamble, self.file_meta,
+            self.is_implicit_VR, self.is_little_endian
+        )
+        filename = self.filename
+        if filename is not None and not isinstance(filename, str):
+            warnings.warn("The 'filename' attribute of the dataset is a "
+                          "file-like object and will be set to None "
+                          "in the copied object")
+            self.filename = None
+        for (k, v) in self.__dict__.items():
+            copied.__dict__[k] = copy_function(v)
+
+        self.filename = filename
+        return copied
+
+    def __copy__(self) -> _FileDataset:
+        """Return a shallow copy of the file dataset.
+        Make sure that the filename is not copied in case it is a file-like
+        object.
 
         Returns
         -------
-        bool
-            The result if `self` and `other` are the same class
-        NotImplemented
-            If `other` is not the same class as `self` then returning
-            :class:`NotImplemented` delegates the result to
-            ``superclass.__eq__(subclass)``.
+        FileDataset
+            A shallow copy of the file data set.
         """
-        # When comparing against self this will be faster
-        if other is self:
-            return True
+        return self._copy_implementation(copy.copy)
 
-        if isinstance(other, self.__class__):
-            return (
-                _dict_equal(self, other)
-                and _dict_equal(
-                    self.__dict__, other.__dict__, exclude=['_dict']
-                )
-            )
+    def __deepcopy__(self, _) -> _FileDataset:
+        """Return a deep copy of the file dataset.
+        Make sure that the filename is not copied in case it is a file-like
+        object.
 
-        return NotImplemented
+        Returns
+        -------
+        FileDataset
+            A deep copy of the file data set.
+        """
+        return self._copy_implementation(copy.deepcopy)
 
 
 def validate_file_meta(
